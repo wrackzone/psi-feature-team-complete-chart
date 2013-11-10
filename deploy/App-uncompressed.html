@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>psifeatureteamcomplete</title>
+
+    <script type="text/javascript" src="/apps/2.0rc1/sdk.js"></script>
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/async/1.22/async.min.js"></script>
+    <script type="text/javascript" src="https://rally1.rallydev.com/apps/2.0rc1/lib/analytics/analytics-all.js"></script>
+
+    <script type="text/javascript">
+        Rally.onReady(function () {
+                // global
+var myMask = null;
+var app = null;
+
+// app
+Ext.define('CustomApp', {
+    scopeType: 'release',
+    extend: 'Rally.app.App',
+    componentCls: 'app',
+
+    launch: function() {
+        console.log("launch 2");
+        // get the project id.
+        this.project = this.getContext().getProject().ObjectID;
+        app = this;
+        var that = this;
+        // get the release (if on a page scoped to the release)
+        var tbName = getReleaseTimeBox(this);
+
+        var configs = [];
+        
+        configs.push({ model : "Project",             
+                       fetch : ['Name','ObjectID'], 
+                       filters : [] 
+        });
+        configs.push({ model : "Release",             
+                       fetch : ['Name', 'ObjectID', 'Project', 'ReleaseStartDate', 'ReleaseDate' ], 
+                       filters:[] 
+        });
+
+        async.map( configs, this.wsapiQuery, function(err,results) {
+            console.log("results",results);
+            that.projects  = results[0];
+            that.releases  = results[1];
+            that.createReleaseCombo(that.releases);
+        });
+    },
+    
+    wsapiQuery : function( config , callback ) {
+        Ext.create('Rally.data.WsapiDataStore', {
+            autoLoad : true,
+            limit : "infinity",
+            model : config.model,
+            fetch : config.fetch,
+            filters : config.filters,
+            sorters : config.sorters,
+            listeners : {
+                scope : this,
+                load : function(store, data) {
+                    callback(null,data);
+                }
+            }
+        });
+    },
+    
+    // creates a release drop down combo box with the uniq set of release names
+    createReleaseCombo : function(releaseRecords) {
+        
+        // given a list of all releases (accross sub projects)
+        var releases = _.map( releaseRecords, function(rec) { return { name : rec.get("Name"), objectid : rec.get("ObjectID"), releaseDate : new Date(Date.parse(rec.get("ReleaseDate"))), releaseStartDate : new Date(Date.parse(rec.get("ReleaseStartDate")))};});
+        // get a unique list by name to display in combobox        
+        releases = _.uniq( releases, function (r) { return r.name; });
+        releases = _.sortBy( releases, function(rec) {return rec.releaseDate;}).reverse();
+        // create a store with the set of unique releases
+        var releasesStore = Ext.create('Ext.data.Store', {
+            fields: ['name','objectid'], data : releases 
+        });
+        // construct the combo box using the store
+        var cb = Ext.create("Ext.ux.CheckCombo", {
+            itemId : 'comboRelease',
+            fieldLabel: 'Release',
+            store: releasesStore,
+            queryMode: 'local',
+            displayField: 'name',
+            valueField: 'name',
+            noData : true,
+            width: 300,
+                
+            listeners : {
+                scope : this,
+                // after collapsing the list
+                collapse : function ( field, eOpts ) {
+                        this.queryFeatures(releases);
+                }
+            }
+        });
+        var container = Ext.create('Ext.container.Container', {
+            layout: {
+                type: 'hbox',
+                align : 'stretch',
+                defaultMargins : { top: 5, right: 20, bottom: 0, left: 5 }
+            }
+        });
+        container.add(cb);
+        this.add(container);
+    },
+    
+    queryFeatures : function(releases) {
+        // get Features for the selected release(s)
+        var comboRelease = this.down("#comboRelease");
+        var that = this;
+        this.rows = [];
+
+        if (comboRelease.getValue()==="") {
+            return;
+        }
+
+        var selectedR = [];
+        // // for each selected release name, select all releases with that name and grab the object id and push it into an 
+        // // array. The result will be an array of all matching release that we will use to query for snapshots.
+        _.each( comboRelease.getValue().split(","), function (rn) {
+            var matching_releases = _.filter( releases, function(r) { return rn == r.name;});
+            var uniq_releases = _.uniq(matching_releases, function(r) { return r.name; });
+            _.each(uniq_releases,function(release) { selectedR.push(release); });
+        });
+
+        if (selectedR.length > 0) {
+            myMask = new Ext.LoadMask(Ext.getBody(), {msg:"Please wait..."});
+            myMask.show();
+        } else {
+            return;
+        }
+
+        var filter = null;
+        var compFilter = null;
+        _.each(selectedR,function(release,i) {
+            var f = Ext.create('Rally.data.QueryFilter', {
+                property: 'Release.Name',
+                operator: '=',
+                value: release.name
+            });
+            filter = i === 0 ? f : filter.or(f);
+        });
+        
+        var fetch = ['ObjectID','FormattedID','Name','LeafStoryCount','AcceptedLeafStoryCount','LeafStoryPlanEstimateTotal','AcceptedLeafStoryPlanEstimateTotal','PercentDoneByStoryCount',"Release","Rank" ];
+        fetch = fetch.concat(_.pluck(app.customColumns,"name"));
+        console.log("fetch",fetch);
+        
+        var config = { 
+            model  : "PortfolioItem/Feature",
+            fetch  : fetch,
+            filters: [filter],
+            sorters: [{ property: 'Rank', direction: 'ASC'}]
+        };
+        
+        async.map([config], this.wsapiQuery, function(err,results) {
+            myMask.hide();
+            console.log("# of features in chart:",results[0].length);
+            // save the selected releases
+            that.selectedR = selectedR; 
+            that.mapSnapshots(results[0]);
+        });
+    },
+
+    // maps the set of story snapshots for each feature
+    mapSnapshots : function( features ) {
+        var that = this;
+        
+        async.map(features, this.readFeatureSnapshots, function(err,results) {
+            var snapshots = [];
+            _.each( results, function(result) { 
+                snapshots = snapshots.concat(result);
+            });
+            console.log("snapshots",snapshots.length);
+            that.processSnapshots(snapshots);
+        });
+
+    },
+    
+    processSnapshots : function( snapshots ) {
+        var that = this;
+        var projects = _.uniq(_.pluck( snapshots, function(s) { return s.get("Project");}));
+        console.log("projects",projects.length);
+        
+        console.log("selected R",that.selectedR);
+        // get the start and end date to chart.
+        var start = _.min(_.pluck(that.selectedR,function(r) { return r.ReleaseStartDate;}));
+        var end   = _.max(_.pluck(that.selectedR,function(r) { return r.ReleaseDate;}));
+        
+        var hcdata = createHighChartsData(snapshots,start,end);
+        
+        console.log("hcdata",hcdata);
+        
+        
+    },
+    
+    
+     // read all stories for a specific feature.
+    readFeatureSnapshots : function(feature,callback) {
+        var that = this;
+
+        Ext.create('Rally.data.lookback.SnapshotStore', {
+            autoLoad : true,
+            listeners: {
+                scope : this,
+                load: function(store, data, success) {
+                    callback(null,data);
+                }
+            },
+            fetch: ['Project', 'ScheduleState', 'PlanEstimate','Children','Iteration'],
+            hydrate : ['ScheduleState'],
+            filters: [
+                {
+                    property: '_TypeHierarchy',
+                    operator: 'in',
+                    value: ['HierarchicalRequirement']
+                },
+                {
+                    property: '_ItemHierarchy',
+                    operator: 'in',
+                    value: [feature.get("ObjectID")]
+                },
+                {
+                    property: 'Children',
+                    operator: '=',
+                    value: null
+                }
+            ]
+        });
+    },
+    
+    projectName : function(pid) {
+        var project = _.find(this.projects,function(p) { return p.get("ObjectID") == pid; });
+        return project ? project.get("Name") : null;
+    }
+    
+});
+
+                // utility methods
+
+// returns the release name if the app is on a page scoped to a release.
+function getReleaseTimeBox(app) {
+    var timeboxScope = app.getContext().getTimeboxScope();
+    var tbName = null;
+    if(timeboxScope) {
+        var record = timeboxScope.getRecord();
+        tbName = record.get('Name');
+    } else {
+        tbName = "";
+    }
+    return tbName;
+}
+
+                Ext.define('Ext.ux.CheckCombo',
+{
+    extend: 'Ext.form.field.ComboBox',
+    alias: 'widget.checkcombo',
+    multiSelect: true,
+    allSelector: false,
+    noData: false,
+    noDataText: 'No combo data',
+    addAllSelector: false,
+    allSelectorHidden: false,
+    enableKeyEvents: true,
+    afterExpandCheck: false,
+    allText: 'All',
+    oldValue: '',
+    listeners:
+    {
+/* uncomment if you want to reload store on every combo expand
+        beforequery: function(qe)
+        {
+            this.store.removeAll();
+            delete qe.combo.lastQuery;
+        },
+*/
+        focus: function(cpt)
+        {
+            cpt.oldValue = cpt.getValue();
+        },
+        keydown: function(cpt, e, eOpts)
+        {
+            var    value = cpt.getRawValue(),
+                oldValue = cpt.oldValue;
+            
+            if(value !== oldValue) cpt.setValue('');
+        }
+    },
+    createPicker: function() 
+    {
+        var    me = this,
+            picker,
+            menuCls = Ext.baseCSSPrefix + 'menu',
+            opts = Ext.apply(
+            {
+                pickerField: me,
+                selModel:
+                {
+                    mode: me.multiSelect ? 'SIMPLE' : 'SINGLE'
+                },
+                floating: true,
+                hidden: true,
+                ownerCt: me.ownerCt,
+                cls: me.el.up('.' + menuCls) ? menuCls : '',
+                store: me.store,
+                displayField: me.displayField,
+                focusOnToFront: false,
+                pageSize: me.pageSize,
+                tpl: 
+                [
+                    '<ul><tpl for=".">',
+                        '<li role="option" class="' + Ext.baseCSSPrefix + 'boundlist-item"><span class="x-combo-checker">&nbsp;</span> {' + me.displayField + '}</li>',
+                    '</tpl></ul>'
+                ]
+            }, me.listConfig, me.defaultListConfig);
+
+
+        picker = me.picker = Ext.create('Ext.view.BoundList', opts);
+        if(me.pageSize) 
+        {
+            picker.pagingToolbar.on('beforechange', me.onPageChange, me);
+        }        
+
+
+        me.mon(picker,
+        {
+            itemclick: me.onItemClick,
+            refresh: me.onListRefresh,
+            scope: me
+        });
+
+
+        me.mon(picker.getSelectionModel(),
+        {
+            'beforeselect': me.onBeforeSelect,
+            'beforedeselect': me.onBeforeDeselect,
+            'selectionchange': me.onListSelectionChange,
+            scope: me
+        });
+
+
+        me.store.on('load', function(store)
+        {
+            if(store.getTotalCount() === 0)
+            {
+                me.allSelectorHidden = true;
+                if(me.allSelector !== false) me.allSelector.setStyle('display', 'none');
+                if(me.noData !== false) me.noData.setStyle('display', 'block');
+            }
+            else
+            {
+                me.allSelectorHidden = false;
+                if(me.allSelector !== false) me.allSelector.setStyle('display', 'block');
+                if(me.noData !== false) me.noData.setStyle('display', 'none');
+            }
+        });
+
+
+        return picker;
+    },
+    reset: function()
+    {
+        var    me = this;
+
+
+        me.setValue('');
+    },
+    setValue: function(value)
+    {
+        this.value = value;
+        if(!value)
+        {
+            if(this.allSelector !== false) this.allSelector.removeCls('x-boundlist-selected');
+            return this.callParent(arguments);
+        }
+
+
+        if(typeof value == 'string') 
+        {
+            var    me = this,
+                records = [],
+                vals = value.split(',');
+
+
+            if(value === '')
+            {
+                if(me.allSelector !== false) me.allSelector.removeCls('x-boundlist-selected');
+            }
+            else
+            {
+                if(vals.length === me.store.getCount() && vals.length !== 0)
+                {
+                    if(me.allSelector !== false) me.allSelector.addCls('x-boundlist-selected');
+                    else me.afterExpandCheck = true;
+                }
+            }
+
+
+            Ext.each(vals, function(val)
+            {
+                var record = me.store.getById(parseInt(val));
+                if(record) records.push(record);
+            });
+
+
+            return me.setValue(records);
+        }
+        else return this.callParent(arguments);
+    },
+    getValue: function()
+    {
+        if(typeof this.value === 'object') return this.value.join(',');
+        else return this.value;
+    },
+    getSubmitValue: function()
+    {
+        return this.getValue();
+    },
+    expand: function()
+    {
+        var    me = this,
+            bodyEl, picker, collapseIf;
+
+
+            if(me.rendered && !me.isExpanded && !me.isDestroyed)
+            {
+            bodyEl = me.bodyEl;
+            picker = me.getPicker();
+            collapseIf = me.collapseIf;
+
+
+            // show the picker and set isExpanded flag
+            picker.show();
+            me.isExpanded = true;
+            me.alignPicker();
+            bodyEl.addCls(me.openCls);
+
+
+            if(me.noData === false) me.noData = picker.getEl().down('.x-boundlist-list-ct').insertHtml('beforeBegin', '<div class="x-boundlist-item" role="option">'+me.noDataText+'</div>', true);
+
+
+            if(me.addAllSelector === true && me.allSelector === false)
+            {
+                me.allSelector = picker.getEl().down('.x-boundlist-list-ct').insertHtml('beforeBegin', '<div class="x-boundlist-item" role="option"><span class="x-combo-checker">&nbsp;</span> '+me.allText+'</div>', true);
+                me.allSelector.on('click', function(e)
+                {
+                    if(me.allSelector.hasCls('x-boundlist-selected'))
+                    {
+                        me.allSelector.removeCls('x-boundlist-selected');
+                        me.setValue('');
+                        me.fireEvent('select', me, []);
+                    }
+                    else
+                    {
+                        var records = [];
+                        me.store.each(function(record)
+                        {
+                            records.push(record);
+                        });
+                        me.allSelector.addCls('x-boundlist-selected');
+                        me.select(records);
+                        me.fireEvent('select', me, records); 
+                    }
+                });
+
+
+                if(me.allSelectorHidden === true) me.allSelector.hide();
+                else me.allSelector.show();
+                
+                if(me.afterExpandCheck === true)
+                {
+                    me.allSelector.addCls('x-boundlist-selected');
+                    me.afterExpandCheck = false;
+                }
+            }
+
+
+            // monitor clicking and mousewheel
+            me.mon(Ext.getDoc(),
+            {
+                mousewheel: collapseIf,
+                mousedown: collapseIf,
+                scope: me
+            });
+            Ext.EventManager.onWindowResize(me.alignPicker, me);
+            me.fireEvent('expand', me);
+            me.onExpand();
+        }
+        else
+        {
+            me.fireEvent('expand', me);
+            me.onExpand();
+        }
+    },
+    alignPicker: function()
+    {    
+        var me = this,
+            picker = me.getPicker();
+
+
+        me.callParent();
+    
+        if(me.addAllSelector === true)
+        {
+            var height = picker.getHeight();
+            height = parseInt(height)+20;
+            picker.setHeight(height);
+            picker.getEl().setStyle('height', height+'px');
+        }
+    },
+    onListSelectionChange: function(list, selectedRecords)
+    {
+        var    me = this,
+            isMulti = me.multiSelect,
+            hasRecords = selectedRecords.length > 0;
+        // Only react to selection if it is not called from setValue, and if our list is
+        // expanded (ignores changes to the selection model triggered elsewhere)
+        if(!me.ignoreSelection && me.isExpanded)
+        {
+            if(!isMulti)
+            {
+                Ext.defer(me.collapse, 1, me);
+            }
+            /*
+            * Only set the value here if we're in multi selection mode or we have
+            * a selection. Otherwise setValue will be called with an empty value
+            * which will cause the change event to fire twice.
+            */
+            if(isMulti || hasRecords)
+            {
+                me.setValue(selectedRecords, false);
+            }
+            if(hasRecords)
+            {
+                me.fireEvent('select', me, selectedRecords);
+            }
+            me.inputEl.focus();
+
+
+            if(me.addAllSelector === true && me.allSelector !== false)
+            {
+                if(selectedRecords.length === me.store.getTotalCount()) me.allSelector.addCls('x-boundlist-selected');
+                else me.allSelector.removeCls('x-boundlist-selected'); 
+            } 
+        }
+    }
+});
+                Ext.define("MyBurnCalculator", {
+   extend: "Rally.data.lookback.calculator.TimeSeriesCalculator",
+   
+    pointsOffset : 0,
+    countOffset : 0,
+   
+    getMetrics: function () {
+        var metrics = [
+           {
+               field: "LeafStoryCount",
+               as: "Planned Count",
+               display: "line",
+               f: "sum"
+           },
+          {
+              field: "LeafStoryPlanEstimateTotal",
+              as: "Planned Points",
+              display: "line",
+              f: "sum"
+          },
+           {
+               field: "CalcPreliminaryEstimate",
+               as: "PreliminaryEstimate",
+               display: "line",
+               f: "sum"
+           },
+            {
+                field: "AcceptedLeafStoryPlanEstimateTotal",
+                as: "Accepted Points",
+                display: "line",
+                f: "sum"
+            },
+            {
+              field: "AcceptedLeafStoryCount",
+              as: "Accepted Count",
+              display: "line",
+              f: "sum"
+            },
+            {
+               field: "ObjectID",
+               as: "Count",
+               display: "column",
+               f: "count"
+            },
+            {
+               field: "Completed",
+               as: "Completed",
+               display: "column",
+               f: "sum"
+            }
+       ];
+        return metrics;
+    },
+    getDerivedFieldsOnInput : function () { 
+        // XS 1, S 3, M 5, L 8, XL 13
+        return [ 
+            {
+                as: 'CalcPreliminaryEstimate', 
+                f:  function(row) {
+                    var r = _.find(app.peRecords, function(rec) { return rec.get("ObjectID") == row.PreliminaryEstimate; });
+                    return r !== undefined ? r.get("Value") : 0;    
+                }
+            },
+            {
+                as: 'Completed', 
+                f:  function(row) {
+                return row.PercentDoneByStoryCount == 1 ? 1 : 0;
+                }
+            }
+        ];
+    },
+    getDerivedFieldsAfterSummary : function () {
+        return [
+            {as: 'ProjectionPoints', 
+            f: function (row, index, summaryMetrics, seriesData) {
+                var that = this;
+                if (index === 0) {
+                    datesData = _.pluck(seriesData,"label");
+                    var today = new Date();
+                    var li = datesData.length-1;
+                    acceptedPointsData = _.pluck(seriesData,"Accepted Points");
+                    acceptedPointsData = _.filter(acceptedPointsData, function(d,i) { return new Date(Date.parse(datesData[i])) < today; });
+                    
+                    // calculate an offset between the projected value and the actual accepted values.
+                    var lastAccepted = acceptedPointsData[acceptedPointsData.length-1];
+                    var lastProjected = linearProject( acceptedPointsData, acceptedPointsData.length-1);
+                    console.log("last accepted:", lastAccepted, "last projected:",lastProjected);
+                    that.pointsOffset = lastAccepted-lastProjected;    
+                }
+                var y = linearProject( acceptedPointsData, index) + that.pointsOffset;
+                return Math.round(y * 100) / 100;
+            }
+          }, 
+          {as: 'ProjectionCount', 
+            f: function (row, index, summaryMetrics, seriesData) {
+                var that = this;
+                if (index === 0) {
+                    datesData = _.pluck(seriesData,"label");
+                    var today = new Date();
+                    var li = datesData.length-1;
+                    acceptedCountData = _.pluck(seriesData,"Accepted Count");
+                    acceptedCountData = _.filter(acceptedCountData, function(d,i) { return new Date(Date.parse(datesData[i])) < today; });
+                    // calculate an offset between the projected value and the actual accepted values.
+                    var lastAccepted = acceptedCountData[acceptedCountData.length-1];
+                    var lastProjected = linearProject( acceptedCountData, acceptedCountData.length-1);
+                    console.log("last accepted:", lastAccepted, "last projected:",lastProjected);
+                    that.countOffset = lastAccepted-lastProjected;    
+
+                }
+                var y = linearProject( acceptedCountData, index) + that.countOffset;
+                return Math.round(y * 100) / 100;
+            }
+          } 
+
+        ];
+    },
+   defined : function(v) {
+        return (!_.isUndefined(v) && !_.isNull(v));            
+    }
+   
+});
+                var createHighChartsData = function ( snapshots, start, end) {
+        
+        var lumenize = window.parent.Rally.data.lookback.Lumenize;
+        console.log("lumenize",lumenize);
+        var snapShotData = _.map(snapshots,function(d){return d.data;});
+        var myCalc = Ext.create("MyBurnCalculator");
+
+
+        // can be used to 'knockout' holidays
+        var holidays = [
+            {year: 2014, month: 1, day: 1}  // Made up holiday to test knockout
+        ];
+
+        // calculator config
+        var config = {
+            deriveFieldsOnInput: myCalc.getDerivedFieldsOnInput(),
+            metrics: myCalc.getMetrics(),
+            summaryMetricsConfig: [],
+            deriveFieldsAfterSummary: myCalc.getDerivedFieldsAfterSummary(),
+            granularity: lumenize.Time.DAY,
+            tz: 'America/Chicago',
+            holidays: holidays,
+            workDays: 'Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday'
+        };
+        // create the calculator and add snapshots to it.
+        calculator = new lumenize.TimeSeriesCalculator(config);
+        
+        // release start and end dates
+        var startOnISOString = new lumenize.Time(start).getISOStringInTZ(config.tz);
+        var upToDateISOString = new lumenize.Time(end).getISOStringInTZ(config.tz);
+
+        calculator.addSnapshots(snapShotData, startOnISOString, upToDateISOString);
+        
+        // create a high charts series config object, used to get the hc series data
+        var hcConfig = [{ name : "label" }, 
+                        this.pointsUnitType() ? { name : "Planned Points" } : { name : "Planned Count" }, 
+                        { name : "PreliminaryEstimate"},
+                        this.pointsUnitType() ? { name : "Accepted Points"} : { name : "Accepted Count"},
+                        this.pointsUnitType() ? { name : "ProjectionPoints"}: { name : "ProjectionCount"},
+                        { name : "Count", type:'column'},
+                        { name : "Completed",type:'column'} ];
+        var hc = lumenize.arrayOfMaps_To_HighChartsSeries(calculator.getResults().seriesData, hcConfig);
+        
+        return hc;
+}
+
+            Rally.launchApp('CustomApp', {
+                name:"psifeatureteamcomplete",
+	            parentRepos:""
+            });
+
+        });
+    </script>
+
+
+    <style type="text/css">
+        .app {
+     /* Add app styles here */
+}
+.x-combo-checker { background-position: 50% -2px; margin-left: 1px; background-color: transparent; background-image: url("https://rally1.rallydev.com/apps/2.0rc1/lib/ext/4.1.1a/resources/themes/images/default/grid/unchecked.gif"); background-position: -1px -1px; background-repeat: no-repeat; height: 14px; width: 14px; display: inline-block; } 
+.x-boundlist-selected .x-combo-checker { background-image: url("https://rally1.rallydev.com/apps/2.0rc1/lib/ext/4.1.1a/resources/themes/images/default/grid/checked.gif"); }
+
+.x-column-header-inner .x-column-header-text {
+    white-space: normal;
+}
+
+.x-column-header {
+    background-color : #99CCFF;
+}
+
+.x-column-header-inner {
+    line-height: normal;
+    padding-top: 3px !important;
+    padding-bottom: 3px !important;
+    text-align: center;
+    top: 20%;
+}
+
+.x-grid-cell-inner {
+    overflow: hidden;
+    /*padding: 8px 12px;*/
+    padding: 6px 2px 2px 2px;
+    white-space: nowrap;
+    height : 28px;
+ }
+ 
+ .tinytext {
+    font-size:xx-small;
+ }
+    </style>
+</head>
+<body></body>
+</html>

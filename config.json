@@ -1,0 +1,18 @@
+{
+   "name": "psifeatureteamcomplete",
+   "className": "CustomApp",
+   "server": "https://rally1.rallydev.com",
+   "sdk": "2.0rc1",
+   "javascript": [
+      "App.js",
+      "utility.js",
+      "combo.js",
+      "calculator.js",
+      "highcharts.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/async/1.22/async.min.js",
+      "https://rally1.rallydev.com/apps/2.0rc1/lib/analytics/analytics-all.js"
+   ],
+   "css": [
+      "app.css"
+   ]
+}
