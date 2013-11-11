@@ -116,7 +116,7 @@ Ext.define('CustomApp', {
 
         if (selectedR.length > 0) {
             myMask = new Ext.LoadMask(Ext.getBody(), {msg:"Please wait..."});
-            myMask.show();
+            // myMask.show();
         } else {
             return;
         }
@@ -174,13 +174,29 @@ Ext.define('CustomApp', {
         
         // get the start and end date to chart.
         var start = _.min(that.selectedR, function(r) { return r.releaseStartDate;});
-        var end   = _.max(that.selectedR, function(r) { return r.releaseDate;});
+        //var end   = _.max(that.selectedR, function(r) { return r.releaseDate;});
+        var date = new Date();
 
-        var hcdata = createHighChartsData(snapshots,start.isoStart,end.isoEnd);
+        var hcdata = createHighChartsData(snapshots,start.isoStart,date.toISOString(),that.projects);
+        
+        // mangle the hc data so we show projects on x-axis.
+        var seriesData = hcdata.slice(1, hcdata.length);
+        var series0 = {name: "label", data : _.map( seriesData, function(h) { return that.projectName(h.name.substring(7)); })};
+        var series = [];
+        _.each(hcdata[0].data, function(w) {
+            i= _.indexOf(hcdata[0].data,w);
+            series.push({
+                name : w,
+                data : _.map( seriesData, function(h){ return h.data[i]})
+            });
+        });
+        
+        console.log("series0",series0);
+        console.log("series",series);
         
         console.log("hcdata",hcdata);
-        
-        
+        // that._showChart(hcdata);
+        that._showChart([series0].concat(series));
     },
     
     
@@ -221,6 +237,70 @@ Ext.define('CustomApp', {
     projectName : function(pid) {
         var project = _.find(this.projects,function(p) { return p.get("ObjectID") == pid; });
         return project ? project.get("Name") : null;
+    },
+    
+    _showChart : function(series) {
+        var that = this;
+        var chart = this.down("#chart1");
+        if (chart !== null)
+            chart.destroy();
+            
+        var extChart = Ext.create('Rally.ui.chart.Chart', {
+            columnWidth : 1,
+            itemId : "chart1",
+            chartData: {
+                categories : series[0].data,
+                series : series.slice(1, series.length)
+            },
+            chartColors: ['Gray', 'Orange', 'Green', 'LightGray', 'Blue','Green'],
+
+            chartConfig : {
+                chart: {
+                    type: 'column'
+                },
+                title: {
+                text: 'Team Release Completion Trend',
+                x: -20 //center
+                },
+                plotOptions: {
+                    series: {
+                        marker: {
+                            radius: 2
+                        }
+                    }
+                },
+                xAxis: {
+                    //tickInterval : 7,
+                    // tickInterval : tickInterval,
+                    type: 'datetime',
+                    labels: {
+                        // formatter: function() {
+                        //     return Highcharts.dateFormat('%b %d', Date.parse(this.value));
+                        // }
+                    }
+                },
+                yAxis: {
+                    title: {
+                        text: "Complete(%)"
+                    },
+                    plotLines: [{
+                        value: 0,
+                        width: 1,
+                        color: '#808080'
+                    }]
+                },
+                tooltip: {
+                },
+                legend: { align: 'center', verticalAlign: 'bottom' }
+            }
+        });
+        this.add(extChart);
+        chart = this.down("#chart1");
+        var p = Ext.get(chart.id);
+        elems = p.query("div.x-mask");
+        _.each(elems, function(e) { e.remove(); });
+        var elems = p.query("div.x-mask-msg");
+        _.each(elems, function(e) { e.remove(); });
     }
     
 });
